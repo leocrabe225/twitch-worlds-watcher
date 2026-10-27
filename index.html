@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<!-- Constant title: nothing duration-related may ever appear here. -->
+<title>Player</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #f2f2f2;
+    --muted: #8a8a8a;
+    --btn: #262626;
+    --btn-active: #5a5a5a;
+    --accent: #9147ff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 16px/1.3 -apple-system, system-ui, sans-serif;
+    overflow: hidden; touch-action: manipulation;
+    -webkit-user-select: none; user-select: none;
+  }
+
+  /* Twitch pauses the embed and ignores play()/seek() whenever anything is drawn
+     over its iframe, even a transparent div. So nothing may overlap #player:
+     the bar sits below it, and taps are blocked with pointer-events instead. */
+  #stage { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); }
+  #player { position: relative; flex: 1; min-height: 0; }
+  #player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
+  /* Only while muted autoplay is blocked (e.g. iOS Low Power Mode): the start
+     screen, which shows no time with controls off, may take one tap. */
+  #player.tappable iframe { pointer-events: auto; }
+
+  #bar {
+    flex: none; display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px;
+    padding: 6px max(8px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  }
+  #bar button {
+    min-width: 48px; min-height: 48px; padding: 0 10px;
+    border: 0; border-radius: 10px; background: var(--btn); color: var(--fg);
+    font: inherit; font-weight: 600; font-variant-numeric: tabular-nums;
+  }
+  #bar button.flash { background: var(--btn-active); }
+  #bar button.confirm { background: var(--accent); }
+  #bar #play { min-width: 72px; }
+  #status, #clock, #info { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 64px; text-align: center; }
+  #info { font-size: 13px; }
+  #status:empty, #info:empty, #clock[hidden] { display: none; }
+
+  /* The panel replaces the stage instead of covering it (see note above). */
+  #panel {
+    position: fixed; inset: 0; z-index: 4; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  #panel[hidden] { display: none; }
+  #panel form { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
+  #panel h1 { font-size: 20px; margin: 0; }
+  #panel input[type=text] {
+    width: 100%; min-height: 48px; padding: 0 12px; border-radius: 10px; border: 1px solid #444;
+    background: #111; color: var(--fg); font: inherit; -webkit-user-select: text; user-select: text;
+  }
+  #panel .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #panel .row input[type=text] { flex: 1; width: auto; min-width: 0; }
+  #panel label { display: flex; align-items: center; gap: 8px; min-height: 48px; }
+  #panel button {
+    min-height: 48px; padding: 0 16px; border: 0; border-radius: 10px;
+    background: var(--btn); color: var(--fg); font: inherit; font-weight: 600;
+  }
+  #panel button[type=submit] { background: var(--accent); }
+  #panel .hint { color: var(--muted); font-size: 13px; margin: 0; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="player"></div>
+
+  <div id="bar">
+    <button data-jump="-1200">−20m</button>
+    <button data-jump="-300">−5m</button>
+    <button data-jump="-30">−30s</button>
+    <button id="play">Play</button>
+    <button data-jump="30">+30s</button>
+    <button data-jump="300">+5m</button>
+    <button data-jump="1200">+20m</button>
+    <button id="mute">Unmute</button>
+    <span id="status"></span>
+    <span id="info"></span>
+    <span id="clock" hidden></span>
+    <button id="menu" aria-label="Settings">⋯</button>
+  </div>
+</div>
+
+<div id="panel" hidden>
+  <form id="vodForm">
+    <h1>Spoiler-free player</h1>
+    <div class="row">
+      <input id="channelInput" type="text" autocomplete="off" autocapitalize="off" placeholder="Channel">
+      <button type="button" id="latestBtn">Latest VOD</button>
+    </div>
+    <div class="row">
+      <button type="button" id="connectBtn">Connect Twitch</button>
+      <span id="authState" class="hint"></span>
+    </div>
+    <input id="vodInput" type="text" inputmode="url" autocomplete="off" autocapitalize="off"
+           placeholder="…or a Twitch VOD URL or ID">
+    <div class="row">
+      <span>Quality</span>
+      <label><input type="radio" name="quality" value="480p"> 480p</label>
+      <label><input type="radio" name="quality" value="720p"> 720p</label>
+      <label><input type="radio" name="quality" value="1080p"> 1080p</label>
+    </div>
+    <label><input type="checkbox" id="showClock"> Show elapsed time</label>
+    <div class="row">
+      <button type="submit">Load</button>
+      <button type="button" id="closePanel">Close</button>
+    </div>
+    <p class="hint">Changing quality or VOD reloads the player at the saved position.</p>
+  </form>
+</div>
+
+<script src="https://player.twitch.tv/js/embed/v1.js"></script>
+<script>
+(() => {
+  const $ = (sel) => document.querySelector(sel);
+  const bar = $("#bar"), status = $("#status"), info = $("#info"), clock = $("#clock"), panel = $("#panel");
+  const playBtn = $("#play"), muteBtn = $("#mute");
+
+  // Public client ID of the "vod-player" app on dev.twitch.tv (no secret involved).
+  const CLIENT_ID = "kw83e4r8448oyb04cdrnz6gdrmivxb";
+
+  // localStorage can throw (private mode); never let that break playback.
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  };
+
+  const settings = {
+    quality: store.get("quality") || "480p",
+    showClock: store.get("showClock") === "1",
+  };
+
+  let player = null, vod = null, playing = false, started = false;
+  let resumeAt = 0, keepPlaying = false, restoreSound = false, confirmedBigJump = false;
+  let playWatchdog = null, startTimer = null;
+
+  function parseVod(text) {
+    const m = String(text).trim().match(/(?:videos\/|^#?(?:vod=)?)(\d{5,})/);
+    return m ? m[1] : null;
+  }
+
+  function vodFromHash() { return parseVod(location.hash.slice(1)); }
+
+  function latestFromHash() {
+    const m = location.hash.match(/[#&]latest=(\w{1,25})/);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  function savedPos(id) { return Number(store.get("pos:" + id)) || 0; }
+
+  function savePos() {
+    if (!player || !vod || !started) return;
+    const t = player.getCurrentTime();
+    if (t > 0) store.set("pos:" + vod, String(Math.floor(t)));
+  }
+
+  function setStatus(text) { status.textContent = text; }
+
+  // ---- loading ----
+  // resume/play/sound let recover() rebuild the player exactly where it was.
+  // setHash is off when the hash should stay as is (#latest=… bookmarks, recover()).
+  function load(id, { resume = savedPos(id), play = false, sound = false, setHash = true, label } = {}) {
+    if (id !== vod) info.textContent = "";
+    if (label) info.textContent = label;
+    vod = id;
+    store.set("lastVod", id);
+    if (setHash && location.hash.slice(1) !== "vod=" + id) history.replaceState(null, "", "#vod=" + id);
+
+    playing = false; started = false;
+    resumeAt = resume; keepPlaying = play; restoreSound = sound;
+    clearTimeout(playWatchdog);
+    clearTimeout(startTimer);
+    playBtn.textContent = "Play";
+    setStatus("Loading…");
+    $("#player").innerHTML = "";
+    $("#player").classList.remove("tappable");
+
+    // Muted autoplay can be refused (iOS Low Power Mode). Then let the user start
+    // it with one tap on Twitch's start screen, and keep playing from there.
+    startTimer = setTimeout(() => {
+      if (started) return;
+      keepPlaying = true;
+      $("#player").classList.add("tappable");
+      setStatus("Tap the video to start");
+    }, 6000);
+
+    // The first play must happen without a tap inside Twitch's iframe, which only
+    // muted autoplay allows. onPlaying() pauses right away so nothing runs unasked.
+    player = new Twitch.Player("player", {
+      video: id,
+      parent: [location.hostname],
+      width: "100%", height: "100%",
+      autoplay: true,
+      muted: true,
+      // Without this Twitch draws a timeline showing the full length.
+      controls: false,
+    });
+    if (new URLSearchParams(location.search).has("debug")) window.player = player;
+
+    player.addEventListener(Twitch.Player.READY, updateMute);
+    player.addEventListener(Twitch.Player.PLAYING, onPlaying);
+    player.addEventListener(Twitch.Player.PAUSE, onPause);
+    player.addEventListener(Twitch.Player.ENDED, onPause);
+  }
+
+  function onPlaying() {
+    if (!started) {
+      started = true;
+      clearTimeout(startTimer);
+      $("#player").classList.remove("tappable");
+      applyQuality();
+      // Twitch may resume from its own saved spot; ours wins when they differ.
+      if (resumeAt > 0 && Math.abs(player.getCurrentTime() - resumeAt) > 10) player.seek(resumeAt);
+      if (!keepPlaying) { player.pause(); return; }
+      if (restoreSound) { player.setMuted(false); updateMute(); }
+    }
+    clearTimeout(playWatchdog);
+    playing = true;
+    playBtn.textContent = "Pause";
+    setStatus("");
+  }
+
+  function onPause() {
+    playing = false;
+    playBtn.textContent = "Play";
+    setStatus(started ? "" : "Loading…");
+    savePos();
+  }
+
+  // If anything ever covers the iframe while it plays, Twitch pauses it and then
+  // ignores play() until the player is rebuilt. Do that quietly at the same spot.
+  function recover() {
+    if (!player || !vod) return;
+    const t = Math.floor(player.getCurrentTime());
+    store.set("pos:" + vod, String(t));
+    load(vod, { resume: t, play: true, sound: !player.getMuted(), setHash: false });
+  }
+
+  function applyQuality() {
+    const qs = player.getQualities() || [];
+    const want = settings.quality;
+    const match = qs.find((q) => String(q.name).startsWith(want) || String(q.group).startsWith(want));
+    if (match) player.setQuality(match.group);
+  }
+
+  // ---- controls ----
+  function togglePlay() {
+    if (!player || !started) return;
+    // isPaused() reports false before the first play, so trust our own event-driven state.
+    if (playing) { player.pause(); return; }
+    player.play();
+    clearTimeout(playWatchdog);
+    playWatchdog = setTimeout(() => { if (!playing) recover(); }, 2500);
+  }
+
+  function updateMute() {
+    muteBtn.textContent = player && player.getMuted() ? "Unmute" : "Mute";
+  }
+
+  function toggleMute() {
+    if (!player) return;
+    player.setMuted(!player.getMuted());
+    updateMute();
+  }
+
+  function flash(btn) {
+    if (!btn) return;
+    btn.classList.add("flash");
+    setTimeout(() => btn.classList.remove("flash"), 180);
+  }
+
+  function jump(seconds, btn) {
+    if (!player || !started) return;
+    if (Math.abs(seconds) >= 1200 && !confirmedBigJump) {
+      if (!btn.classList.contains("confirm")) {
+        btn.dataset.label = btn.textContent;
+        btn.textContent = "Sure?";
+        btn.classList.add("confirm");
+        setTimeout(() => {
+          btn.classList.remove("confirm");
+          btn.textContent = btn.dataset.label;
+        }, 3000);
+        return;
+      }
+      confirmedBigJump = true;
+      btn.classList.remove("confirm");
+      btn.textContent = btn.dataset.label;
+    }
+    flash(btn);
+    const target = Math.max(0, player.getCurrentTime() + seconds);
+    // Duration is only used for this check and never shown. A jump that would
+    // pass the end is silently dropped, with the same feedback as any jump.
+    const end = player.getDuration();
+    if (end > 0 && target >= end - 2) return;
+    player.seek(target);
+    store.set("pos:" + vod, String(Math.floor(target)));
+  }
+
+  function fmt(t) {
+    t = Math.floor(t);
+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60;
+    return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+
+  function updateClock() {
+    clock.hidden = !settings.showClock;
+    if (settings.showClock && player && started) clock.textContent = fmt(player.getCurrentTime());
+  }
+
+  $("#player").addEventListener("click", togglePlay);
+  bar.addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    if (btn.dataset.jump) jump(Number(btn.dataset.jump), btn);
+    else if (btn === playBtn) togglePlay();
+    else if (btn === muteBtn) toggleMute();
+    else if (btn.id === "menu") openPanel();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (!panel.hidden) return;
+    const keys = {
+      ArrowLeft: -30, ArrowRight: 30, ArrowDown: -300, ArrowUp: 300, PageDown: -1200, PageUp: 1200,
+    };
+    if (e.key in keys) {
+      e.preventDefault();
+      // Keyboard skips the "Sure?" step: no fat-finger risk on a keyboard.
+      const wasConfirmed = confirmedBigJump;
+      confirmedBigJump = true;
+      jump(keys[e.key], bar.querySelector(`[data-jump="${keys[e.key]}"]`));
+      confirmedBigJump = wasConfirmed;
+    } else if (e.key === " ") {
+      e.preventDefault();
+      togglePlay();
+    }
+  });
+
+  // ---- settings panel ----
+  // The panel covers the iframe, so the next play() may be ignored; the play
+  // watchdog then rebuilds the player at the same spot (see recover()).
+  function openPanel() {
+    if (playing) player.pause();
+    $("#vodInput").value = vod || "";
+    for (const r of document.querySelectorAll("input[name=quality]")) r.checked = r.value === settings.quality;
+    $("#showClock").checked = settings.showClock;
+    $("#closePanel").hidden = !vod;
+    $("#channelInput").value = store.get("channel") || "caedrel";
+    updateAuthState();
+    panel.hidden = false;
+  }
+
+  $("#closePanel").addEventListener("click", () => { panel.hidden = true; });
+
+  $("#connectBtn").addEventListener("click", connectTwitch);
+
+  $("#latestBtn").addEventListener("click", () => {
+    const channel = $("#channelInput").value.trim().toLowerCase();
+    if (!/^\w{1,25}$/.test(channel)) { $("#channelInput").focus(); return; }
+    store.set("channel", channel);
+    history.replaceState(null, "", "#latest=" + channel);
+    panel.hidden = true;
+    loadLatest(channel);
+  });
+
+  // ---- Twitch API: latest VOD of a channel ----
+  // Implicit-grant login: no secret, the token comes back in the URL hash.
+  function connectTwitch() {
+    const state = Math.random().toString(36).slice(2);
+    store.set("authState", state);
+    store.set("authReturn", location.hash);
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      // Must exactly match a redirect URL registered on dev.twitch.tv.
+      redirect_uri: location.origin + location.pathname.replace(/index\.html$/, ""),
+      response_type: "token",
+      scope: "",
+      state,
+    });
+    location.href = "https://id.twitch.tv/oauth2/authorize?" + params;
+  }
+
+  function handleAuthRedirect() {
+    const h = new URLSearchParams(location.hash.slice(1));
+    if (!h.has("access_token") && !h.has("error")) return;
+    if (h.get("access_token") && h.get("state") === store.get("authState")) store.set("token", h.get("access_token"));
+    history.replaceState(null, "", location.pathname + location.search + (store.get("authReturn") || ""));
+  }
+
+  function updateAuthState() {
+    const ok = !!store.get("token");
+    $("#connectBtn").textContent = ok ? "Reconnect Twitch" : "Connect Twitch";
+    $("#authState").textContent = ok ? "Connected" : "Needed for Latest VOD";
+  }
+
+  async function helix(path) {
+    const token = store.get("token");
+    if (!token) throw new Error("auth");
+    const r = await fetch("https://api.twitch.tv/helix/" + path, {
+      headers: { "Client-Id": CLIENT_ID, Authorization: "Bearer " + token },
+    });
+    if (r.status === 401) { store.set("token", ""); throw new Error("auth"); }
+    if (!r.ok) throw new Error("http");
+    return (await r.json()).data;
+  }
+
+  async function latestVod(channel) {
+    const [user] = await helix("users?login=" + encodeURIComponent(channel));
+    if (!user) throw new Error("channel");
+    const [video] = await helix("videos?type=archive&first=1&user_id=" + user.id);
+    if (!video) throw new Error("novod");
+    // The response also has duration and title: both are spoilers, never read them.
+    return { id: video.id, startedAt: video.created_at };
+  }
+
+  async function loadLatest(channel) {
+    setStatus("Finding latest VOD…");
+    try {
+      const v = await latestVod(channel);
+      const when = new Date(v.startedAt).toLocaleString(undefined, {
+        weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+      });
+      const label = "VOD from " + when;
+      if (v.id === vod && player) {
+        info.textContent = label;
+        setStatus(started ? "" : "Loading…");
+        return;
+      }
+      savePos();
+      load(v.id, { setHash: false, label });
+    } catch (err) {
+      const messages = {
+        auth: "Connect Twitch in ⋯ first",
+        channel: "Unknown channel",
+        novod: "No VODs on this channel",
+      };
+      setStatus(messages[err.message] || "Couldn't reach Twitch");
+    }
+  }
+
+  $("#vodForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const id = parseVod($("#vodInput").value);
+    if (!id) { $("#vodInput").focus(); return; }
+    const q = document.querySelector("input[name=quality]:checked");
+    const qualityChanged = q && q.value !== settings.quality;
+    if (q) { settings.quality = q.value; store.set("quality", q.value); }
+    settings.showClock = $("#showClock").checked;
+    store.set("showClock", settings.showClock ? "1" : "0");
+    updateClock();
+    panel.hidden = true;
+    if (id !== vod) { savePos(); load(id); }
+    else if (qualityChanged) { savePos(); load(id, { setHash: false }); }
+  });
+
+  // ---- persistence ----
+  setInterval(() => { if (playing) savePos(); updateClock(); }, 1000);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) savePos(); });
+  window.addEventListener("pagehide", savePos);
+  window.addEventListener("hashchange", () => {
+    const latest = latestFromHash();
+    if (latest) { loadLatest(latest); return; }
+    const id = vodFromHash();
+    if (id && id !== vod) { savePos(); load(id); }
+  });
+
+  // ---- start ----
+  handleAuthRedirect();
+  updateClock();
+  const latest = latestFromHash();
+  const initial = vodFromHash() || store.get("lastVod");
+  if (latest) loadLatest(latest);
+  else if (initial) load(initial);
+  else openPanel();
+})();
+</script>
+</body>
+</html>
