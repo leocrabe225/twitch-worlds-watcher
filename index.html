@@ -31,8 +31,14 @@
      over its iframe, even a transparent div. So nothing may overlap #player:
      the bar sits below it, and taps are blocked with pointer-events instead. */
   #stage { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); }
-  #player { position: relative; flex: 1; min-height: 0; }
-  #player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
+  /* The iframe is sized by fitPlayer() to the video's own box plus a hidden strip
+     above and below, clipped here, so Twitch's banners (e.g. "portions of this
+     video have been muted") fall outside the visible area. */
+  #player { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+  #player iframe { position: absolute; border: 0; pointer-events: none; }
+
+  /* Phone landscape: video only. A tap shows the bar for a few seconds. */
+  body.landscape #bar.hidden { display: none; }
   /* Only while muted autoplay is blocked (e.g. iOS Low Power Mode): the start
      screen, which shows no time with controls off, may take one tap. */
   #player.tappable iframe { pointer-events: auto; }
@@ -211,6 +217,7 @@
       controls: false,
     });
     if (new URLSearchParams(location.search).has("debug")) window.player = player;
+    fitPlayer();
 
     player.addEventListener(Twitch.Player.READY, updateMute);
     player.addEventListener(Twitch.Player.PLAYING, onPlaying);
@@ -322,8 +329,53 @@
     if (settings.showClock && player && started) clock.textContent = fmt(player.getCurrentTime());
   }
 
-  $("#player").addEventListener("click", togglePlay);
+  // ---- layout ----
+  // Height of the strip hidden above and below the video, where Twitch draws its banners.
+  const BANNER_STRIP = 64;
+
+  // Size the iframe to exactly the 16:9 video box that fits #player, extended by
+  // BANNER_STRIP on top and bottom. Twitch letterboxes the video into the middle,
+  // so the visible part is all video and the banners land in the clipped strips.
+  function fitPlayer() {
+    const frame = $("#player iframe");
+    if (!frame) return;
+    const box = $("#player").getBoundingClientRect();
+    const w = Math.min(box.width, (box.height * 16) / 9);
+    const h = (w * 9) / 16;
+    Object.assign(frame.style, {
+      width: w + "px",
+      height: h + 2 * BANNER_STRIP + "px",
+      left: (box.width - w) / 2 + "px",
+      top: (box.height - h) / 2 - BANNER_STRIP + "px",
+    });
+  }
+  new ResizeObserver(fitPlayer).observe($("#player"));
+
+  const landscapeQuery = matchMedia("(orientation: landscape) and (max-height: 500px)");
+  let barTimer = null;
+
+  function isLandscape() { return document.body.classList.contains("landscape"); }
+
+  function showBarBriefly() {
+    bar.classList.remove("hidden");
+    clearTimeout(barTimer);
+    barTimer = setTimeout(() => bar.classList.add("hidden"), 4000);
+  }
+
+  function updateOrientation() {
+    document.body.classList.toggle("landscape", landscapeQuery.matches);
+    clearTimeout(barTimer);
+    bar.classList.toggle("hidden", landscapeQuery.matches);
+  }
+  landscapeQuery.addEventListener("change", updateOrientation);
+  updateOrientation();
+
+  // Portrait: tapping the video plays/pauses. Landscape: it brings the bar back.
+  $("#player").addEventListener("click", () => {
+    if (isLandscape()) showBarBriefly(); else togglePlay();
+  });
   bar.addEventListener("click", (e) => {
+    if (isLandscape()) showBarBriefly();
     const btn = e.target.closest("button");
     if (!btn) return;
     if (btn.dataset.jump) jump(Number(btn.dataset.jump), btn);
