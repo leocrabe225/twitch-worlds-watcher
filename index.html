@@ -31,11 +31,12 @@
      over its iframe, even a transparent div. So nothing may overlap #player:
      the bar sits below it, and taps are blocked with pointer-events instead. */
   #stage { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); }
-  /* The iframe is sized by fitPlayer() to the video's own box plus a hidden strip
-     above and below, clipped here, so Twitch's banners (e.g. "portions of this
-     video have been muted") fall outside the visible area. */
-  #player { position: relative; flex: 1; min-height: 0; overflow: hidden; }
-  #player iframe { position: absolute; border: 0; pointer-events: none; }
+  #screen { position: relative; flex: 1; min-height: 0; }
+  /* fitPlayer() sizes #player to the video's exact box and the iframe to that box
+     plus a hidden strip above and below, clipped here, so Twitch's banners (e.g.
+     "portions of this video have been muted") fall outside the visible area. */
+  #player { position: absolute; overflow: hidden; }
+  #player iframe { position: absolute; left: 0; border: 0; pointer-events: none; }
 
   /* Phone landscape: video only. A tap shows the bar for a few seconds. */
   body.landscape #bar.hidden { display: none; }
@@ -84,7 +85,7 @@
 </head>
 <body>
 <div id="stage">
-  <div id="player"></div>
+  <div id="screen"><div id="player"></div></div>
 
   <div id="bar">
     <button data-jump="-1200">−20m</button>
@@ -330,26 +331,35 @@
   }
 
   // ---- layout ----
-  // Height of the strip hidden above and below the video, where Twitch draws its banners.
-  const BANNER_STRIP = 64;
+  // Height of the strip hidden above and below the video. Twitch anchors its
+  // banners to the iframe's edges: the muted-audio notice sits up to ~220px above
+  // the bottom edge on desktop, ~130px on a phone in landscape.
+  const BANNER_STRIP = 240;
 
-  // Size the iframe to exactly the 16:9 video box that fits #player, extended by
-  // BANNER_STRIP on top and bottom. Twitch letterboxes the video into the middle,
-  // so the visible part is all video and the banners land in the clipped strips.
+  // Clip #player to exactly the 16:9 video box that fits #screen, and extend the
+  // iframe by a strip on top and bottom. Twitch letterboxes the video into the
+  // middle, so the visible part is all video and the banners land in the strips.
   function fitPlayer() {
-    const frame = $("#player iframe");
-    if (!frame) return;
-    const box = $("#player").getBoundingClientRect();
+    const box = $("#screen").getBoundingClientRect();
     const w = Math.min(box.width, (box.height * 16) / 9);
     const h = (w * 9) / 16;
+    Object.assign($("#player").style, {
+      width: w + "px",
+      height: h + "px",
+      left: (box.width - w) / 2 + "px",
+      top: (box.height - h) / 2 + "px",
+    });
+    const frame = $("#player iframe");
+    if (!frame) return;
+    // Twitch stops playing once less than about half of its iframe is visible.
+    const strip = Math.min(BANNER_STRIP, Math.floor(h / 2));
     Object.assign(frame.style, {
       width: w + "px",
-      height: h + 2 * BANNER_STRIP + "px",
-      left: (box.width - w) / 2 + "px",
-      top: (box.height - h) / 2 - BANNER_STRIP + "px",
+      height: h + 2 * strip + "px",
+      top: -strip + "px",
     });
   }
-  new ResizeObserver(fitPlayer).observe($("#player"));
+  new ResizeObserver(fitPlayer).observe($("#screen"));
 
   const landscapeQuery = matchMedia("(orientation: landscape) and (max-height: 500px)");
   let barTimer = null;
@@ -371,7 +381,7 @@
   updateOrientation();
 
   // Portrait: tapping the video plays/pauses. Landscape: it brings the bar back.
-  $("#player").addEventListener("click", () => {
+  $("#screen").addEventListener("click", () => {
     if (isLandscape()) showBarBriefly(); else togglePlay();
   });
   bar.addEventListener("click", (e) => {
