@@ -38,8 +38,11 @@
   #player { position: absolute; overflow: hidden; }
   #player iframe { position: absolute; left: 0; border: 0; pointer-events: none; }
 
-  /* Phone landscape: video only. A tap shows the bar for a few seconds. */
-  body.landscape #bar.hidden { display: none; }
+  /* Phone landscape and desktop: video only. A tap (phone) or mouse move
+     (desktop) shows the bar for a few seconds. */
+  body.immersive #bar.hidden { display: none; }
+  body.immersive:has(#bar.hidden) #screen { cursor: none; }
+  body:not(.desktop) #fullscreen { display: none; }
   /* Only while muted autoplay is blocked (e.g. iOS Low Power Mode): the start
      screen, which shows no time with controls off, may take one tap. */
   #player.tappable iframe { pointer-events: auto; }
@@ -88,17 +91,18 @@
   <div id="screen"><div id="player"></div></div>
 
   <div id="bar">
-    <button data-jump="-1200">−20m</button>
-    <button data-jump="-300">−5m</button>
-    <button data-jump="-30">−30s</button>
-    <button id="play">Play</button>
-    <button data-jump="30">+30s</button>
-    <button data-jump="300">+5m</button>
-    <button data-jump="1200">+20m</button>
-    <button id="mute">Unmute</button>
+    <button data-jump="-1200" title="PgDn">−20m</button>
+    <button data-jump="-300" title="↓">−5m</button>
+    <button data-jump="-30" title="←">−30s</button>
+    <button id="play" title="Space or K">Play</button>
+    <button data-jump="30" title="→">+30s</button>
+    <button data-jump="300" title="↑">+5m</button>
+    <button data-jump="1200" title="PgUp">+20m</button>
+    <button id="mute" title="M">Unmute</button>
     <span id="status"></span>
     <span id="info"></span>
     <span id="clock" hidden></span>
+    <button id="fullscreen" title="F" aria-label="Fullscreen">⛶</button>
     <button id="menu" aria-label="Settings">⋯</button>
   </div>
 </div>
@@ -155,6 +159,10 @@
   let player = null, vod = null, playing = false, started = false;
   let resumeAt = 0, keepPlaying = false, restoreSound = false, confirmedBigJump = false;
   let playWatchdog = null, startTimer = null;
+  // Rapid jumps accumulate into seekTarget and are sent as one seek once the
+  // presses stop: while a seek loads, getCurrentTime() still reports the old
+  // spot, and each new seek would cancel the previous one and stall playback.
+  let seekTarget = null, seekTimer = null, settleTimer = null;
 
   function parseVod(text) {
     const m = String(text).trim().match(/(?:videos\/|^#?(?:vod=)?)(\d{5,})/);
@@ -172,7 +180,7 @@
 
   function savePos() {
     if (!player || !vod || !started) return;
-    const t = player.getCurrentTime();
+    const t = position();
     if (t > 0) store.set("pos:" + vod, String(Math.floor(t)));
   }
 
@@ -192,6 +200,11 @@
     resumeAt = resume; keepPlaying = play; restoreSound = sound;
     clearTimeout(playWatchdog);
     clearTimeout(startTimer);
+    resetSeek();
+    // Every new player starts muted (required for autoplay).
+    muted = true;
+    clearTimeout(muteSyncTimer);
+    updateMute();
     playBtn.textContent = "Play";
     setStatus("Loading…");
     $("#player").innerHTML = "";
@@ -220,7 +233,7 @@
     if (new URLSearchParams(location.search).has("debug")) window.player = player;
     fitPlayer();
 
-    player.addEventListener(Twitch.Player.READY, updateMute);
+    player.addEventListener(Twitch.Player.READY, syncMute);
     player.addEventListener(Twitch.Player.PLAYING, onPlaying);
     player.addEventListener(Twitch.Player.PAUSE, onPause);
     player.addEventListener(Twitch.Player.ENDED, onPause);
@@ -235,7 +248,7 @@
       // Twitch may resume from its own saved spot; ours wins when they differ.
       if (resumeAt > 0 && Math.abs(player.getCurrentTime() - resumeAt) > 10) player.seek(resumeAt);
       if (!keepPlaying) { player.pause(); return; }
-      if (restoreSound) { player.setMuted(false); updateMute(); }
+      if (restoreSound) setMuted(false);
     }
     clearTimeout(playWatchdog);
     playing = true;
@@ -254,9 +267,9 @@
   // ignores play() until the player is rebuilt. Do that quietly at the same spot.
   function recover() {
     if (!player || !vod) return;
-    const t = Math.floor(player.getCurrentTime());
+    const t = Math.floor(position());
     store.set("pos:" + vod, String(t));
-    load(vod, { resume: t, play: true, sound: !player.getMuted(), setHash: false });
+    load(vod, { resume: t, play: true, sound: !muted, setHash: false });
   }
 
   function applyQuality() {
@@ -276,14 +289,32 @@
     playWatchdog = setTimeout(() => { if (!playing) recover(); }, 2500);
   }
 
+  // getMuted() is a cached copy of the iframe's state that updates a moment
+  // after setMuted(), so the button follows our own `muted` and re-reads the
+  // real state shortly after (the browser may also refuse to unmute).
+  let muted = true, muteSyncTimer = null;
+
   function updateMute() {
-    muteBtn.textContent = player && player.getMuted() ? "Unmute" : "Mute";
+    muteBtn.textContent = muted ? "Unmute" : "Mute";
+  }
+
+  function syncMute() {
+    if (!player) return;
+    muted = player.getMuted();
+    updateMute();
+  }
+
+  function setMuted(value) {
+    muted = value;
+    player.setMuted(value);
+    updateMute();
+    clearTimeout(muteSyncTimer);
+    muteSyncTimer = setTimeout(syncMute, 1500);
   }
 
   function toggleMute() {
     if (!player) return;
-    player.setMuted(!player.getMuted());
-    updateMute();
+    setMuted(!muted);
   }
 
   function flash(btn) {
@@ -310,13 +341,30 @@
       btn.textContent = btn.dataset.label;
     }
     flash(btn);
-    const target = Math.max(0, player.getCurrentTime() + seconds);
+    const target = Math.max(0, position() + seconds);
     // Duration is only used for this check and never shown. A jump that would
     // pass the end is silently dropped, with the same feedback as any jump.
     const end = player.getDuration();
     if (end > 0 && target >= end - 2) return;
-    player.seek(target);
+    seekTarget = target;
     store.set("pos:" + vod, String(Math.floor(target)));
+    clearTimeout(seekTimer);
+    clearTimeout(settleTimer);
+    seekTimer = setTimeout(() => {
+      player.seek(seekTarget);
+      settleTimer = setTimeout(() => { seekTarget = null; }, 1500);
+    }, 300);
+  }
+
+  // Where playback is, or is about to be once pending jumps land.
+  function position() {
+    return seekTarget ?? player.getCurrentTime();
+  }
+
+  function resetSeek() {
+    clearTimeout(seekTimer);
+    clearTimeout(settleTimer);
+    seekTarget = null;
   }
 
   function fmt(t) {
@@ -327,7 +375,7 @@
 
   function updateClock() {
     clock.hidden = !settings.showClock;
-    if (settings.showClock && player && started) clock.textContent = fmt(player.getCurrentTime());
+    if (settings.showClock && player && started) clock.textContent = fmt(position());
   }
 
   // ---- layout ----
@@ -361,54 +409,79 @@
   }
   new ResizeObserver(fitPlayer).observe($("#screen"));
 
+  // The bar can't float over the video (see #player), so in immersive mode it is
+  // hidden and the video takes the whole screen until it is called back.
   const landscapeQuery = matchMedia("(orientation: landscape) and (max-height: 500px)");
-  let barTimer = null;
+  const desktop = matchMedia("(hover: hover) and (pointer: fine)").matches;
+  let barTimer = null, overBar = false;
 
-  function isLandscape() { return document.body.classList.contains("landscape"); }
+  function isImmersive() { return document.body.classList.contains("immersive"); }
 
   function showBarBriefly() {
+    if (!isImmersive()) return;
     bar.classList.remove("hidden");
     clearTimeout(barTimer);
-    barTimer = setTimeout(() => bar.classList.add("hidden"), 4000);
+    if (!overBar) barTimer = setTimeout(() => bar.classList.add("hidden"), desktop ? 3000 : 4000);
   }
 
-  function updateOrientation() {
-    document.body.classList.toggle("landscape", landscapeQuery.matches);
+  function updateMode() {
+    const immersive = desktop || landscapeQuery.matches;
+    document.body.classList.toggle("immersive", immersive);
+    document.body.classList.toggle("desktop", desktop);
     clearTimeout(barTimer);
-    bar.classList.toggle("hidden", landscapeQuery.matches);
+    bar.classList.toggle("hidden", immersive);
   }
-  landscapeQuery.addEventListener("change", updateOrientation);
-  updateOrientation();
+  landscapeQuery.addEventListener("change", updateMode);
+  updateMode();
 
-  // Portrait: tapping the video plays/pauses. Landscape: it brings the bar back.
+  function toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  }
+
+  if (desktop) {
+    document.addEventListener("mousemove", showBarBriefly);
+    bar.addEventListener("mouseenter", () => { overBar = true; showBarBriefly(); });
+    bar.addEventListener("mouseleave", () => { overBar = false; showBarBriefly(); });
+  }
+
+  // Phone portrait: tapping the video plays/pauses. Phone landscape: it brings
+  // the bar back. Desktop: click plays/pauses, double-click toggles fullscreen.
   $("#screen").addEventListener("click", () => {
-    if (isLandscape()) showBarBriefly(); else togglePlay();
+    if (isImmersive() && !desktop) showBarBriefly(); else togglePlay();
   });
+  $("#screen").addEventListener("dblclick", () => { if (desktop) toggleFullscreen(); });
   bar.addEventListener("click", (e) => {
-    if (isLandscape()) showBarBriefly();
+    showBarBriefly();
     const btn = e.target.closest("button");
     if (!btn) return;
     if (btn.dataset.jump) jump(Number(btn.dataset.jump), btn);
     else if (btn === playBtn) togglePlay();
     else if (btn === muteBtn) toggleMute();
+    else if (btn.id === "fullscreen") toggleFullscreen();
     else if (btn.id === "menu") openPanel();
   });
 
   document.addEventListener("keydown", (e) => {
-    if (!panel.hidden) return;
+    if (!panel.hidden || e.ctrlKey || e.metaKey || e.altKey) return;
     const keys = {
       ArrowLeft: -30, ArrowRight: 30, ArrowDown: -300, ArrowUp: 300, PageDown: -1200, PageUp: 1200,
     };
-    if (e.key in keys) {
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (key in keys) {
       e.preventDefault();
       // Keyboard skips the "Sure?" step: no fat-finger risk on a keyboard.
       const wasConfirmed = confirmedBigJump;
       confirmedBigJump = true;
-      jump(keys[e.key], bar.querySelector(`[data-jump="${keys[e.key]}"]`));
+      jump(keys[key], bar.querySelector(`[data-jump="${keys[key]}"]`));
       confirmedBigJump = wasConfirmed;
-    } else if (e.key === " ") {
+    } else if (key === " " || key === "k") {
       e.preventDefault();
       togglePlay();
+    } else if (key === "m") {
+      toggleMute();
+    } else if (key === "f") {
+      toggleFullscreen();
     }
   });
 
